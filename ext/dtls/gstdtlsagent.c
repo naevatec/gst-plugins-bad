@@ -42,10 +42,6 @@
 GST_DEBUG_CATEGORY_STATIC (gst_dtls_agent_debug);
 #define GST_CAT_DEFAULT gst_dtls_agent_debug
 
-G_DEFINE_TYPE (GstDtlsAgent, gst_dtls_agent, G_TYPE_OBJECT);
-
-#define GST_DTLS_AGENT_GET_PRIVATE(obj) (G_TYPE_INSTANCE_GET_PRIVATE((obj), GST_TYPE_DTLS_AGENT, GstDtlsAgentPrivate))
-
 enum
 {
   PROP_0,
@@ -61,6 +57,8 @@ struct _GstDtlsAgentPrivate
 
   GstDtlsCertificate *certificate;
 };
+
+G_DEFINE_TYPE_WITH_PRIVATE (GstDtlsAgent, gst_dtls_agent, G_TYPE_OBJECT);
 
 static void gst_dtls_agent_finalize (GObject * gobject);
 static void gst_dtls_agent_set_property (GObject *, guint prop_id,
@@ -81,7 +79,7 @@ ssl_locking_function (gint mode, gint lock_num, const gchar * file, gint line)
   reading = mode & CRYPTO_READ;
   lock = &ssl_locks[lock_num];
 
-  GST_LOG_OBJECT (NULL, "%s SSL lock for %s, thread=%p location=%s:%d",
+  GST_TRACE_OBJECT (NULL, "%s SSL lock for %s, thread=%p location=%s:%d",
       locking ? "locking" : "unlocking", reading ? "reading" : "writing",
       g_thread_self (), file, line);
 
@@ -100,10 +98,10 @@ ssl_locking_function (gint mode, gint lock_num, const gchar * file, gint line)
   }
 }
 
-static gulong
-ssl_thread_id_function (void)
+static void
+ssl_thread_id_function (CRYPTO_THREADID * id)
 {
-  return (gulong) g_thread_self ();
+  CRYPTO_THREADID_set_pointer (id, g_thread_self ());
 }
 #endif
 
@@ -122,14 +120,13 @@ _gst_dtls_init_openssl (void)
           OPENSSL_VERSION_TEXT);
       g_assert_not_reached ();
     }
-
+#if OPENSSL_VERSION_NUMBER < 0x10100000L
     GST_INFO_OBJECT (NULL, "initializing openssl %lx", OPENSSL_VERSION_NUMBER);
     SSL_library_init ();
     SSL_load_error_strings ();
     ERR_load_BIO_strings ();
 
-#if OPENSSL_VERSION_NUMBER < 0x10100000L
-    {
+    if (!CRYPTO_get_locking_callback ()) {
       gint i;
       gint num_locks;
       num_locks = CRYPTO_num_locks ();
@@ -138,7 +135,7 @@ _gst_dtls_init_openssl (void)
         g_rw_lock_init (&ssl_locks[i]);
       }
       CRYPTO_set_locking_callback (ssl_locking_function);
-      CRYPTO_set_id_callback (ssl_thread_id_function);
+      CRYPTO_THREADID_set_callback (ssl_thread_id_function);
     }
 #endif
 
@@ -150,8 +147,6 @@ static void
 gst_dtls_agent_class_init (GstDtlsAgentClass * klass)
 {
   GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
-
-  g_type_class_add_private (klass, sizeof (GstDtlsAgentPrivate));
 
   gobject_class->set_property = gst_dtls_agent_set_property;
   gobject_class->finalize = gst_dtls_agent_finalize;
@@ -168,10 +163,18 @@ gst_dtls_agent_class_init (GstDtlsAgentClass * klass)
   _gst_dtls_init_openssl ();
 }
 
+static int
+ssl_warn_cb (const char *str, size_t len, void *u)
+{
+  GstDtlsAgent *self = u;
+  GST_WARNING_OBJECT (self, "ssl error: %s", str);
+  return 0;
+}
+
 static void
 gst_dtls_agent_init (GstDtlsAgent * self)
 {
-  GstDtlsAgentPrivate *priv = GST_DTLS_AGENT_GET_PRIVATE (self);
+  GstDtlsAgentPrivate *priv = gst_dtls_agent_get_instance_private (self);
   self->priv = priv;
 
   ERR_clear_error ();
@@ -181,15 +184,16 @@ gst_dtls_agent_init (GstDtlsAgent * self)
 #else
   priv->ssl_context = SSL_CTX_new (DTLSv1_method ());
 #endif
-  if (ERR_peek_error () || !priv->ssl_context) {
-    char buf[512];
-
-    priv->ssl_context = NULL;
-
-    GST_WARNING_OBJECT (self, "Error creating SSL Context: %s",
-        ERR_error_string (ERR_get_error (), buf));
+  if (!priv->ssl_context) {
+    GST_WARNING_OBJECT (self, "Error creating SSL Context");
+    ERR_print_errors_cb (ssl_warn_cb, self);
 
     g_return_if_reached ();
+  }
+  /* If any non-fatal issues happened, print them out and carry on */
+  if (ERR_peek_error ()) {
+    ERR_print_errors_cb (ssl_warn_cb, self);
+    ERR_clear_error ();
   }
 
   SSL_CTX_set_verify_depth (priv->ssl_context, 2);
@@ -197,7 +201,7 @@ gst_dtls_agent_init (GstDtlsAgent * self)
   SSL_CTX_set_cipher_list (priv->ssl_context,
       "ALL:!ADH:!LOW:!EXP:!MD5:@STRENGTH");
   SSL_CTX_set_read_ahead (priv->ssl_context, 1);
-#if OPENSSL_VERSION_NUMBER >= 0x1000200fL
+#if (OPENSSL_VERSION_NUMBER >= 0x1000200fL) && (OPENSSL_VERSION_NUMBER < 0x10100000L)
   SSL_CTX_set_ecdh_auto (priv->ssl_context, 1);
 #endif
 }

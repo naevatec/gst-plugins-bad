@@ -46,6 +46,7 @@ struct _GstDtlsEnc {
     GstElement element;
 
     GstPad *src;
+    GstFlowReturn src_ret;
 
     GQueue queue;
     GMutex queue_lock;
@@ -62,7 +63,6 @@ struct _GstDtlsEnc {
     guint srtp_auth;
 
     gboolean send_initial_events;
-    gboolean schedule_task;
 };
 
 struct _GstDtlsEncClass {
